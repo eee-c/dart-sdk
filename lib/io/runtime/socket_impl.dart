@@ -1,0 +1,567 @@
+// Copyright (c) 2012, the Dart project authors.  Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+
+class _SocketBase {
+  // Bit flags used when communicating between the eventhandler and
+  // dart code. The EVENT flags are used to indicate events of
+  // interest when sending a message from dart code to the
+  // eventhandler. When receiving a message from the eventhandler the
+  // EVENT flags indicate the events that actually happened. The
+  // COMMAND flags are used to send commands from dart to the
+  // eventhandler. COMMAND flags are never received from the
+  // eventhandler. Additional flags are used to communicate other
+  // information.
+  static final int _IN_EVENT = 0;
+  static final int _OUT_EVENT = 1;
+  static final int _ERROR_EVENT = 2;
+  static final int _CLOSE_EVENT = 3;
+
+  static final int _CLOSE_COMMAND = 8;
+  static final int _SHUTDOWN_READ_COMMAND = 9;
+  static final int _SHUTDOWN_WRITE_COMMAND = 10;
+
+  // Flag send to the eventhandler providing additional information on
+  // the type of the file descriptor.
+  static final int _LISTENING_SOCKET = 16;
+  static final int _PIPE = 17;
+
+  static final int _FIRST_EVENT = _IN_EVENT;
+  static final int _LAST_EVENT = _CLOSE_EVENT;
+
+  static final int _FIRST_COMMAND = _CLOSE_COMMAND;
+  static final int _LAST_COMMAND = _SHUTDOWN_WRITE_COMMAND;
+
+  _SocketBase () {
+    _handlerMap = new List(_LAST_EVENT + 1);
+    _handlerMask = 0;
+    _canActivateHandlers = true;
+    _id = -1;
+    _EventHandler._start();
+    _hashCode = _nextHashCode;
+    _nextHashCode = (_nextHashCode + 1) & 0xFFFFFFF;
+  }
+
+  // Multiplexes socket events to the socket handlers.
+  void _multiplex(int event_mask) {
+    _canActivateHandlers = false;
+    for (int i = _FIRST_EVENT; i <= _LAST_EVENT; i++) {
+      if (((event_mask & (1 << i)) != 0)) {
+        if ((i == _CLOSE_EVENT) && this is _Socket && _id >= 0) {
+          _closedRead = true;
+          if (_closedWrite) _close();
+        }
+
+        var eventHandler = _handlerMap[i];
+        if (eventHandler != null || i == _ERROR_EVENT) {
+          // Unregister the out handler before executing it.
+          if (i == _OUT_EVENT) _setHandler(i, null);
+
+          // Don't call the in handler if there is no data available
+          // after all.
+          if ((i == _IN_EVENT) && (this is _Socket) && (available() == 0)) {
+            continue;
+          }
+          if (i == _ERROR_EVENT) {
+            _reportError(_getError(), "");
+            close();
+          } else {
+            eventHandler();
+          }
+        }
+      }
+    }
+    _canActivateHandlers = true;
+    _activateHandlers();
+  }
+
+  void _setHandler(int event, Function callback) {
+    if (callback == null) {
+      _handlerMask &= ~(1 << event);
+    } else {
+      _handlerMask |= (1 << event);
+    }
+    _handlerMap[event] = callback;
+    // If the socket is only for writing then close the receive port
+    // when not waiting for any events.
+    if (this is _Socket &&
+        _closedRead &&
+        _handlerMask == 0 &&
+        _handler != null) {
+      _handler.close();
+      _handler = null;
+    } else {
+      _activateHandlers();
+    }
+  }
+
+  OSError _getError() native "Socket_GetError";
+  int _getPort() native "Socket_GetPort";
+
+  void set onError(void callback(Exception e)) {
+    _setHandler(_ERROR_EVENT, callback);
+  }
+
+  void _activateHandlers() {
+    if (_canActivateHandlers && (_id >= 0)) {
+      if (_handlerMask == 0) {
+        if (_handler != null) {
+          _handler.close();
+          _handler = null;
+        }
+        return;
+      }
+      int data = _handlerMask;
+      if (_isListenSocket()) {
+        data |= (1 << _LISTENING_SOCKET);
+      } else {
+        if (_closedRead) { data &= ~(1 << _IN_EVENT); }
+        if (_closedWrite) { data &= ~(1 << _OUT_EVENT); }
+        if (_isPipe()) data |= (1 << _PIPE);
+      }
+      _sendToEventHandler(data);
+    }
+  }
+
+  int get port() {
+    if (_port === null) {
+      _port = _getPort();
+    }
+    return _port;
+  }
+
+  void close([bool halfClose = false]) {
+    if (_id >= 0) {
+      if (halfClose) {
+        _closeWrite();
+      } else {
+        _close();
+      }
+    } else if (_handler != null) {
+      // This is to support closing sockets created but never assigned
+      // any actual socket.
+      _handler.close();
+      _handler = null;
+    }
+  }
+
+  void _closeWrite() {
+    if (_id >= 0) {
+      if (_closedRead) {
+        _close();
+      } else {
+        _sendToEventHandler(1 << _SHUTDOWN_WRITE_COMMAND);
+      }
+      _closedWrite = true;
+    }
+  }
+
+  void _closeRead() {
+    if (_id >= 0) {
+      if (_closedWrite) {
+        _close();
+      } else {
+        _sendToEventHandler(1 << _SHUTDOWN_READ_COMMAND);
+      }
+      _closedRead = true;
+    }
+  }
+
+  void _close() {
+    if (_id >= 0) {
+      _sendToEventHandler(1 << _CLOSE_COMMAND);
+      _handler.close();
+      _handler = null;
+      _id = -1;
+    }
+  }
+
+  void _sendToEventHandler(int data) {
+    if (_handler === null) {
+      _handler = new ReceivePort();
+      _handler.receive((var message, ignored) { _multiplex(message); });
+    }
+    assert(_id >= 0);
+    _EventHandler._sendData(_id, _handler, data);
+  }
+
+  bool _reportError(error, String message) {
+    void doReportError(Exception e) {
+      // Invoke the error callback if any.
+      if (_handlerMap[_ERROR_EVENT] != null) {
+        _handlerMap[_ERROR_EVENT](e);
+      }
+      // Propagate the error to any additional listeners.
+      _propagateError(e);
+    }
+
+    // For all errors we close the socket, call the error handler and
+    // disable further calls of the error handler.
+    close();
+    if (error is OSError) {
+      doReportError(new SocketIOException(message, error));
+    } else if (error is List) {
+      assert(_isErrorResponse(error));
+      switch (error[0]) {
+        case _FileUtils.kIllegalArgumentResponse:
+          doReportError(new IllegalArgumentException());
+          break;
+        case _FileUtils.kOSErrorResponse:
+          doReportError(new SocketIOException(
+              message, new OSError(error[2], error[1])));
+          break;
+        default:
+          doReportError(new Exception("Unknown error"));
+          break;
+      }
+    } else {
+      doReportError(new SocketIOException(message));
+    }
+  }
+
+  int hashCode() => _hashCode;
+
+  void _propagateError(Exception e) => null;
+
+  abstract bool _isListenSocket();
+  abstract bool _isPipe();
+
+  // Socket id is set from native. -1 indicates that the socket was closed.
+  int _id;
+
+  // Dedicated ReceivePort for socket events.
+  ReceivePort _handler;
+
+  // Poll event to handler map.
+  List _handlerMap;
+
+  // Indicates for which poll events the socket registered handlers.
+  int _handlerMask;
+
+  // Indicates if native interrupts can be activated.
+  bool _canActivateHandlers;
+
+  // Holds the port of the socket, null if not known.
+  int _port;
+
+  // Hash code for the socket. Currently this is just a counter.
+  int _hashCode;
+  static int _nextHashCode = 0;
+  bool _closedRead = false;
+  bool _closedWrite = false;
+}
+
+
+class _ServerSocket extends _SocketBase implements ServerSocket {
+  // Constructor for server socket. First a socket object is allocated
+  // in which the native socket is stored. After that _createBind
+  // is called which creates a file descriptor and binds the given address
+  // and port to the socket. Null is returned if file descriptor creation or
+  // bind failed.
+  factory _ServerSocket(String bindAddress, int port, int backlog) {
+    _ServerSocket socket = new _ServerSocket._internal();
+    var result = socket._createBindListen(bindAddress, port, backlog);
+    if (result is OSError) {
+      socket.close();
+      throw new SocketIOException("Failed to create server socket", result);
+    }
+    assert(result);
+    if (port != 0) {
+      socket._port = port;
+    }
+    return socket;
+  }
+
+  _ServerSocket._internal();
+
+  _accept(Socket socket) native "ServerSocket_Accept";
+
+  _createBindListen(String bindAddress, int port, int backlog)
+      native "ServerSocket_CreateBindListen";
+
+  void set onConnection(void callback(Socket connection)) {
+    _clientConnectionHandler = callback;
+    _setHandler(_IN_EVENT,
+                _clientConnectionHandler != null ? _connectionHandler : null);
+  }
+
+  void _connectionHandler() {
+    if (_id >= 0) {
+      _Socket socket = new _Socket._internal();
+      var result = _accept(socket);
+      if (result is OSError) {
+        _reportError(result, "Accept failed");
+      } else if (result) {
+        _clientConnectionHandler(socket);
+      } else {
+        // Temporary failure accepting the connection. Ignoring
+        // temporary failures lets us retry when we wake up with data
+        // on the listening socket again.
+      }
+    }
+  }
+
+  bool _isListenSocket() => true;
+  bool _isPipe() => false;
+
+  var _clientConnectionHandler;
+}
+
+
+class _Socket extends _SocketBase implements Socket {
+  static final kSuccessResponse = 0;
+  static final kIllegalArgumentResponse = 1;
+  static final kOSErrorResponse = 2;
+
+  static final kHostNameLookup = 0;
+
+  // Constructs a new socket. During the construction an asynchronous
+  // host name lookup is initiated. The returned socket is not yet
+  // connected but ready for registration of callbacks.
+  factory _Socket(String host, int port) {
+    Socket socket = new _Socket._internal();
+    _ensureSocketService();
+    List request = new List(2);
+    request[0] = kHostNameLookup;
+    request[1] = host;
+    _socketService.call(request).then((response) {
+      if (socket._isErrorResponse(response)) {
+        socket._reportError(response, "Failed host name lookup");
+      } else{
+        var result = socket._createConnect(response, port);
+        if (result is OSError) {
+          socket.close();
+          socket._reportError(result, "Connection failed");
+        } else {
+          socket._activateHandlers();
+        }
+      }
+    });
+    return socket;
+  }
+
+  _Socket._internal();
+  _Socket._internalReadOnly() : _pipe = true { super._closedWrite = true; }
+  _Socket._internalWriteOnly() : _pipe = true { super._closedRead = true; }
+
+  int available() {
+    if (_id >= 0) {
+      return _available();
+    }
+    throw new
+        SocketIOException("Error: available failed - invalid socket handle");
+  }
+
+  int _available() native "Socket_Available";
+
+  int readList(List<int> buffer, int offset, int bytes) {
+    if (_id >= 0) {
+      if (bytes == 0) {
+        return 0;
+      }
+      if (offset < 0) {
+        throw new IndexOutOfRangeException(offset);
+      }
+      if (bytes < 0) {
+        throw new IndexOutOfRangeException(bytes);
+      }
+      if ((offset + bytes) > buffer.length) {
+        throw new IndexOutOfRangeException(offset + bytes);
+      }
+      var result = _readList(buffer, offset, bytes);
+      if (result is OSError) {
+        _reportError(result, "Read failed");
+        return -1;
+      }
+      return result;
+    }
+    throw new
+        SocketIOException("Error: readList failed - invalid socket handle");
+  }
+
+  _readList(List<int> buffer, int offset, int bytes)
+      native "Socket_ReadList";
+
+  int writeList(List<int> buffer, int offset, int bytes) {
+    if (_id >= 0) {
+      if (bytes == 0) {
+        return 0;
+      }
+      if (offset < 0) {
+        throw new IndexOutOfRangeException(offset);
+      }
+      if (bytes < 0) {
+        throw new IndexOutOfRangeException(bytes);
+      }
+      if ((offset + bytes) > buffer.length) {
+        throw new IndexOutOfRangeException(offset + bytes);
+      }
+      // When using the Dart C API to access raw data, using a ByteArray is
+      // currently much faster. This function will make a copy of the
+      // supplied List to a ByteArray if it isn't already.
+      List outBuffer;
+      int outOffset = offset;
+      if (buffer is ByteArray || buffer is ObjectArray) {
+        outBuffer = buffer;
+      } else {
+        outBuffer = new ByteArray(bytes);
+        outOffset = 0;
+        int j = offset;
+        for (int i = 0; i < bytes; i++) {
+          int value = buffer[j];
+          if (value is! int) {
+            throw new FileIOException(
+                "List element is not an integer at index $j");
+          }
+          outBuffer[i] = value;
+          j++;
+        }
+      }
+      var result = _writeList(outBuffer, outOffset, bytes);
+      if (result is OSError) {
+        // If writing fails we return 0 as the number of bytes and
+        // report the error on the error handler.
+        result = 0;
+        _reportError(result, "Write failed");
+      }
+      return result;
+    }
+    throw new SocketIOException("writeList failed - invalid socket handle");
+  }
+
+  _writeList(List<int> buffer, int offset, int bytes)
+      native "Socket_WriteList";
+
+  bool _isErrorResponse(response) {
+    return response is List && response[0] != _FileUtils.kSuccessResponse;
+  }
+
+  bool _createConnect(String host, int port) native "Socket_CreateConnect";
+
+  void set onWrite(void callback()) {
+    if (_outputStream != null) throw new StreamException(
+            "Cannot set write handler when output stream is used");
+    _clientWriteHandler = callback;
+    _updateOutHandler();
+  }
+
+  void set onConnect(void callback()) {
+    if (_seenFirstOutEvent || _outputStream != null) {
+      throw new StreamException(
+          "Cannot set connect handler when already connected");
+    }
+    if (_outputStream != null) {
+      throw new StreamException(
+          "Cannot set connect handler when output stream is used");
+    }
+    _clientConnectHandler = callback;
+    _updateOutHandler();
+  }
+
+  void set onData(void callback()) {
+    if (_inputStream != null) throw new StreamException(
+            "Cannot set data handler when input stream is used");
+    _onData = callback;
+  }
+
+  void set onClosed(void callback()) {
+    if (_inputStream != null) throw new StreamException(
+           "Cannot set close handler when input stream is used");
+    _onClosed = callback;
+  }
+
+  bool _isListenSocket() => false;
+
+  bool _isPipe() => _pipe;
+
+  InputStream get inputStream() {
+    if (_inputStream == null) {
+      if (_handlerMap[_IN_EVENT] !== null ||
+          _handlerMap[_CLOSE_EVENT] !== null) {
+        throw new StreamException(
+            "Cannot get input stream when socket handlers are used");
+      }
+      _inputStream = new SocketInputStream(this);
+    }
+    return _inputStream;
+  }
+
+  OutputStream get outputStream() {
+    if (_outputStream == null) {
+      if (_handlerMap[_OUT_EVENT] !== null) {
+        throw new StreamException(
+            "Cannot get input stream when socket handlers are used");
+      }
+      _outputStream = new SocketOutputStream(this);
+    }
+    return _outputStream;
+  }
+
+  void set _onWrite(void callback()) {
+    _setHandler(_OUT_EVENT, callback);
+  }
+
+  void set _onData(void callback()) {
+    _setHandler(_IN_EVENT, callback);
+  }
+
+  void set _onClosed(void callback()) {
+    _setHandler(_CLOSE_EVENT, callback);
+  }
+
+  void _propagateError(Exception e) {
+    if (_inputStream != null) {
+      _inputStream._onError(e);
+    }
+    if (_outputStream != null) {
+      _outputStream._onError(e);
+    }
+  }
+
+  void _updateOutHandler() {
+    void firstWriteHandler() {
+      assert(!_seenFirstOutEvent);
+      _seenFirstOutEvent = true;
+
+      // From now on the write handler is only the client write
+      // handler (connect handler cannot be called again). Change this
+      // before calling any handlers as handlers can change the
+      // handlers.
+      if (_clientWriteHandler === null) _onWrite = _clientWriteHandler;
+
+      // First out event is socket connected event.
+      if (_clientConnectHandler !== null) _clientConnectHandler();
+      _clientConnectHandler = null;
+
+      // Always (even for the first out event) call the write handler.
+      if (_clientWriteHandler !== null) _clientWriteHandler();
+    }
+
+    if (_clientConnectHandler === null && _clientWriteHandler === null) {
+      _onWrite = null;
+    } else {
+      if (_seenFirstOutEvent) {
+        _onWrite = _clientWriteHandler;
+      } else {
+        _onWrite = firstWriteHandler;
+      }
+    }
+  }
+
+  static SendPort _newServicePort() native "Socket_NewServicePort";
+
+  static void _ensureSocketService() {
+    if (_socketService == null) {
+      _socketService = _Socket._newServicePort();
+    }
+  }
+
+  bool _seenFirstOutEvent = false;
+  bool _pipe = false;
+  Function _clientConnectHandler;
+  Function _clientWriteHandler;
+  SocketInputStream _inputStream;
+  SocketOutputStream _outputStream;
+  static SendPort _socketService;
+}
