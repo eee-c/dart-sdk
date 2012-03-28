@@ -60,6 +60,7 @@ void main() {
   String outputDir;
   String contains;
   String title;
+  String description;
 
   for (int i = 0; i < args.length - 1; i++) {
     final arg = args[i];
@@ -83,6 +84,9 @@ void main() {
         }
         else if (arg.startsWith('--title=')) {
           title = arg.substring('--title='.length);
+        }
+        else if (arg.startsWith('--description=')) {
+          description = arg.substring('--description='.length);
         }
         else if (arg.startsWith('--contains=')) {
           contains = arg.substring('--contains='.length);
@@ -116,6 +120,7 @@ void main() {
   if (mode != null) dartdoc.mode = mode;
   if (outputDir != null) dartdoc.outputDir = outputDir;
   if (title != null) dartdoc.mainTitle = title;
+  if (description != null) dartdoc.description = description;
   if (contains != null) dartdoc.contains = contains;
 
   cleanOutputDirectory(dartdoc.outputDir);
@@ -231,6 +236,9 @@ class Dartdoc {
 
   /* The URL that the embedded search results should be displayed on. */
   String searchResultsUrl = 'results.html';
+
+  /** Set this to add a brief description on the index page (below the title) */
+  String description = '';
 
   /** Set this to add footer text to each generated page. */
   String footerText = '';
@@ -448,6 +456,7 @@ class Dartdoc {
     writeHeader(mainTitle, []);
 
     writeln('<h2>$mainTitle</h2>');
+    writeln('<p>$description</p>');
     writeln('<h3>Libraries</h3>');
 
     for (final library in _sortedLibraries) {
