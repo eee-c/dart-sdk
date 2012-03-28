@@ -58,6 +58,8 @@ void main() {
   bool includeSource;
   String mode;
   String outputDir;
+  String contains;
+  String title;
 
   for (int i = 0; i < args.length - 1; i++) {
     final arg = args[i];
@@ -78,7 +80,14 @@ void main() {
       default:
         if (arg.startsWith('--out=')) {
           outputDir = arg.substring('--out='.length);
-        } else {
+        }
+        else if (arg.startsWith('--title=')) {
+          title = arg.substring('--title='.length);
+        }
+        else if (arg.startsWith('--contains=')) {
+          contains = arg.substring('--contains='.length);
+        }
+        else {
           print('Unknown option: $arg');
           return;
         }
@@ -106,6 +115,8 @@ void main() {
   if (includeSource != null) dartdoc.includeSource = includeSource;
   if (mode != null) dartdoc.mode = mode;
   if (outputDir != null) dartdoc.outputDir = outputDir;
+  if (title != null) dartdoc.mainTitle = title;
+  if (contains != null) dartdoc.contains = contains;
 
   cleanOutputDirectory(dartdoc.outputDir);
 
@@ -224,6 +235,9 @@ class Dartdoc {
   /** Set this to add footer text to each generated page. */
   String footerText = '';
 
+  /** Only generate documentation for libraries whose names contains this */
+  Pattern contains = '';
+
   /**
    * From exposes the set of libraries in `world.libraries`. That maps library
    * *keys* to [Library] objects. The keys are *not* exactly the same as their
@@ -280,7 +294,12 @@ class Dartdoc {
       world.resolveAll();
 
       // Sort the libraries by name (not key).
-      _sortedLibraries = world.libraries.getValues();
+      _sortedLibraries = world.
+        libraries.
+        getValues().
+        filter((library) {
+          return library.name.contains(contains);
+        });
       _sortedLibraries.sort((a, b) {
         return a.name.toUpperCase().compareTo(b.name.toUpperCase());
       });
