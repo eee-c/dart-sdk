@@ -1048,11 +1048,18 @@ class Dartdoc {
 
   /** Gets the URL for the documentation for [type]. */
   String typeUrl(Type type) {
-    if (type.isTop) return '${sanitize(type.library.name)}.html';
+    String library = sanitize(type.library.name);
+
+    // If limiting docs to libraries containing a substring, then point all
+    // other docs to api.dartlang.org
+    String path = type.library.name.contains(contains) ?
+      "" : "http://api.dartlang.org/";
+
+    if (type.isTop) return '$path$library.html';
     // Always get the generic type to strip off any type parameters or
     // arguments. If the type isn't generic, genericType returns `this`, so it
     // works for non-generic types too.
-    return '${sanitize(type.library.name)}/${type.genericType.name}.html';
+    return '$path$library/${type.genericType.name}.html';
   }
 
   /** Gets the URL for the documentation for [member]. */
