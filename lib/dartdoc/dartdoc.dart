@@ -56,9 +56,9 @@ void main() {
 
   // Parse the dartdoc options.
   bool includeSource;
+  bool includeDartApi;
   String mode;
   String outputDir;
-  String contains;
   String title;
   String description;
 
@@ -68,6 +68,10 @@ void main() {
     switch (arg) {
       case '--no-code':
         includeSource = false;
+        break;
+
+      case '--no-dart-api':
+        includeDartApi = false;
         break;
 
       case '--mode=static':
@@ -87,9 +91,6 @@ void main() {
         }
         else if (arg.startsWith('--description=')) {
           description = arg.substring('--description='.length);
-        }
-        else if (arg.startsWith('--contains=')) {
-          contains = arg.substring('--contains='.length);
         }
         else {
           print('Unknown option: $arg');
@@ -117,11 +118,11 @@ void main() {
   final dartdoc = new Dartdoc();
 
   if (includeSource != null) dartdoc.includeSource = includeSource;
+  if (includeDartApi != null) dartdoc.includeDartApi = includeDartApi;
   if (mode != null) dartdoc.mode = mode;
   if (outputDir != null) dartdoc.outputDir = outputDir;
   if (title != null) dartdoc.mainTitle = title;
   if (description != null) dartdoc.description = description;
-  if (contains != null) dartdoc.contains = contains;
 
   cleanOutputDirectory(dartdoc.outputDir);
 
@@ -204,6 +205,11 @@ void compileScript(String compilerPath, String libDir,
 }
 
 class Dartdoc {
+  /** Set to `true` to include core Dart documentation in the output (core, io,
+   * html, etc). Otherwise just link to api.dartlang.org as necessary
+   */
+  bool includeDartApi = true;
+
   /** Set to `false` to not include the source code in the generated docs. */
   bool includeSource = true;
 
@@ -242,9 +248,6 @@ class Dartdoc {
 
   /** Set this to add footer text to each generated page. */
   String footerText = '';
-
-  /** Only generate documentation for libraries whose names contains this */
-  Pattern contains = '';
 
   /**
    * From exposes the set of libraries in `world.libraries`. That maps library
@@ -305,9 +308,8 @@ class Dartdoc {
       _sortedLibraries = world.
         libraries.
         getValues().
-        filter((library) {
-          return library.name.contains(contains);
-        });
+        filter(_includeLibrary);
+
       _sortedLibraries.sort((a, b) {
         return a.name.toUpperCase().compareTo(b.name.toUpperCase());
       });
@@ -322,6 +324,17 @@ class Dartdoc {
     } finally {
       options.dietParse = oldDietParse;
     }
+  }
+
+  bool _includeLibrary(Library library) {
+    // Exclude main.dart that might be index of library
+    if (library.name == 'main') return false;
+
+    if (includeDartApi) return true;
+
+    if (library.isDartApi) return false;
+
+    return true;
   }
 
   void startFile(String path) {
@@ -1052,8 +1065,8 @@ class Dartdoc {
 
     // If limiting docs to libraries containing a substring, then point all
     // other docs to api.dartlang.org
-    String path = type.library.name.contains(contains) ?
-      "" : "http://api.dartlang.org/";
+    String path = (!includeDartApi && type.library.isDartApi) ?
+      "http://api.dartlang.org/" : "";
 
     if (type.isTop) return '$path$library.html';
     // Always get the generic type to strip off any type parameters or

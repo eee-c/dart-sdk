@@ -300,6 +300,22 @@ class Library extends Element {
     visitor.addSource(baseSource);
   }
 
+  static Set<String> get dartApiLibraries() =>
+    new Set.from([
+      'core',
+      'dart:core',
+      'coreimpl',
+      'dart:coreimpl',
+      'dart:isolate',
+      'html',
+      'dart:html',
+      'io',
+      'json',
+      'uri'
+    ]);
+
+  bool get isDartApi() => Library.dartApiLibraries.contains(this.name);
+
   toString() => baseSource.filename;
 
   int hashCode() => baseSource.filename.hashCode();
